@@ -1,108 +1,47 @@
-// cityheaven.js
 const { chromium } = require('playwright');
-const readline = require('readline');
+const fs = require('fs');
 
 (async () => {
   const browser = await chromium.launch({ headless: false });
-  const context = await browser.newContext();
-  const page = await context.newPage();
+  const page = await browser.newPage();
+  console.log("Navigating to the page...");
+  await page.goto('https://www.cityheaven.net/niigata/A1501/A150101/arabiannight/girlid-52809022/');
+  console.log("Done navigating to the page.");
+  await page.waitForTimeout(1000);
+  console.log("Logging in");
+  await page.click('a[href="#login"]');
+  console.log("Clicked on log in button");
+  await page.waitForTimeout(1000);
+  console.log("Filling in the login form");
+  await page.fill("input[type='text']", "amritacharya");
+  await page.fill("input[type='password']", "12345678");
+  console.log("Submitting the login form");
+  await page.click('input[id="submitLogin"]');
+  console.log("Logged in successfully");
+  const cookies = await page.context().cookies();
 
-  const girlId = 52800421;
-  const girlUrl = `https://www.cityheaven.net/niigata/A1501/A150101/arabiannight/girlid-${girlId}/`;
+  fs.writeFileSync('files/cookies.json', JSON.stringify(cookies, null, 2));
+  console.log("Cookies saved to files/cookies.json");
 
-  // 1️⃣ Go to girl page
-  console.log(`Navigating to girl page: ${girlUrl}`);
-  await page.goto(girlUrl, { waitUntil: 'networkidle' });
-  console.log('Page loaded.');
+  const user_agent = await page.evaluate(() => navigator.userAgent);
+  fs.writeFileSync('files/user_agent.txt', user_agent);
+  console.log("User agent saved to user_agent.txt");
 
-  // 2️⃣ Handle login if modal exists
-  if (await page.locator('input[type="password"]').count() > 0) {
-    console.log("Login modal detected. Starting login process...");
-
-    await page.click('a[href="#login"]');
-    console.log('Clicked login link. Waiting for login form...');
-    await page.waitForSelector('#user', { state: 'visible' });
-    console.log('Login form visible. Filling credentials...');
-
-    await page.fill('#user', 'amritacharya');
-    await page.fill('#pass', '12345678');
-    console.log('Credentials filled. Submitting login form...');
-
-    // Wait for AJAX login response instead of navigation
-    await Promise.all([
-      page.waitForResponse(resp =>
-        resp.url().includes('login') && resp.status() === 200
-      ),
-      page.click('#submitLogin')
-    ]);
-
-    console.log("Login completed.");
-  } else {
-    console.log('No login modal detected. Proceeding without login.');
-  }
-
-  // 3️⃣ Click reserve button and wait for navigation
-  //     console.log(await page.content());
-  console.log("Clicking reserve button...");
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: 'networkidle' }),
-    page.click('#reserve_btn')
-  ]);
-
-  
-
-  // 4️⃣ Wait for calendar menu, allow manual intervention if not found
-  console.log("Waiting for calendar menu (店舗の空き状況 tab)...");
-  try {
-    console.log('Looking for course selection tab (a#condition_course)...');
-    await page.waitForSelector('a[id="condition_course"]', { timeout: 10000 });
-    console.log('Found course selection tab. Clicking...');
-    await page.click('a[id="condition_course"]');
-
-    const course80 = page.locator('.recommend_table div:has-text("80分")');
-    console.log('Waiting for 80分 course option to appear...');
-    await course80.waitFor({ state: 'visible' });
-    console.log('80分 course option visible. Clicking select button...');
-
-    await course80
-      .locator('button:has-text("選択する")')
-      .click();
-    console.log('Clicked select button for 80分 course.');
-
-    console.log('Waiting for available slots to appear...');
-    await page.waitForSelector('span[data-mark="o"]', { timeout: 20000 });
-
-    const slots = page.locator('span[data-mark="o"]');
-    const count = await slots.count();
-
-    console.log("Available slots found:", count);
-
-    if (count > 0) {
-      await slots.first().click();
-      console.log("Clicked first available slot");
-    } else {
-      console.log("No available slots.");
+  const localStorageData = await page.evaluate(() => {
+    let data = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      data[key] = localStorage.getItem(key);
     }
+    return data;
+  });
 
-  } catch (e) {
-    console.log("Process failed at calendar/course/slot selection step.");
-    console.log("Error details:", e);
-    console.log("If you see the calendar tab, please click it manually, select the course and slot, then press Enter in the terminal to continue.");
-    await new Promise(resolve => {
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      rl.question('Press Enter after you have manually completed the calendar and slot selection, or want to finish...', () => {
-        rl.close();
-        resolve();
-      });
-    });
-    return;
-  }
+  fs.writeFileSync('files/localStorage.json', JSON.stringify(localStorageData, null, 2));
 
-  // 5️⃣ Wait for available slots
-  console.log("Process completed. Waiting before closing...");
-  await page.waitForTimeout(60000);
+  console.log('LocalStorage saved');
 
-  console.log('Closing browser.');
+  await page.waitForTimeout(5000);
   await browser.close();
-  console.log('Browser closed. Script finished.');
+
+
 })();
