@@ -142,97 +142,89 @@ func main() {
 		}
 	}
 
-	// 2. Polling Loop
-	highlightColor.Println("\n[2] Starting Polling Loop with Auto-Discovery...")
+	// 2. Targeted Polling Loop — Single Girl Mode
+	highlightColor.Println("\n[2] 🎯 Single Girl Mode — Polling for Available Slots...")
+	fmt.Printf("   Target: Girl %s\n", TargetGirlID)
+	fmt.Printf("   URL: %s\n", BaseURL+"girlid-"+TargetGirlID+"/")
+	fmt.Printf("   Poll Interval: %v\n", PollInterval)
 
+	pollCount := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			// A. Dynamic Girl Discovery
-			fmt.Println("\n   🕵️  Scanning shop page for girls...")
-			girls, err := c.ListGirls(BaseURL)
-			if err != nil {
-				errorColor("   ❌ Error listing girls: %v\n", err)
-				infoColor("Don't worry, this doesn't mean the program has crashed, the current proxy being used is not working, switching proxies...\n\n\n")
-				time.Sleep(PollInterval)
-				continue
-			}
-			fmt.Printf("   🔍 Found %d girls on page.\n", len(girls))
+			pollCount++
 
-			// B. Iterate through each girl
-			for i, girlID := range girls {
-				// Check availability (Max 1 set of weeks since S6 returns 2 weeks)
-				weeksToCheck := 1
-				foundSlots := false
+			// Check JST time each poll
+			jstNow := time.Now().In(jst)
+			jstH := jstNow.Hour()
 
-				// === Per-Girl Proxy Strategy: SmartProxy first, then file proxies ===
-				proxyAttempts := []string{"smartproxy", "file"}
+			// Proxy strategy: SmartProxy first, then file proxies
+			proxyAttempts := []string{"smartproxy", "file"}
+			foundSlots := false
 
-				for _, proxyMode := range proxyAttempts {
-					// Switch proxy mode and get a fresh sticky IP
-					pm.RotateSticky() // Clear old sticky so we get a new IP
+			for _, proxyMode := range proxyAttempts {
+				// Get a fresh sticky IP for this attempt
+				pm.RotateSticky()
+				if proxyMode == "smartproxy" {
+					pm.UseSmartproxy()
+				} else if proxyMode == "file" {
+					if !pm.HasFileProxies() {
+						continue
+					}
+					pm.UseFileProxies()
+				}
+
+				proxyInfo := pm.GetCurrentProxyInfo()
+				fmt.Printf("\n   🎯 [Poll #%d] Girl %s | %s | Proxy: %s\n",
+					pollCount, TargetGirlID, jstNow.Format("15:04:05 JST"), proxyInfo)
+
+				if jstH < 9 || jstH >= 20 {
+					warnColor("      ⚠️  Outside booking hours (09:00-20:00 JST)\n")
+				}
+
+				targetURL := fmt.Sprintf(CalendarBaseFormat, 1, TargetGirlID)
+				slots, err := c.FetchCalendar(targetURL)
+				if err != nil {
+					warnColor("      ⚠️  Calendar fetch failed via %s: %v\n", proxyMode, err)
 					if proxyMode == "smartproxy" {
-						pm.UseSmartproxy()
-					} else if proxyMode == "file" {
-						if !pm.HasFileProxies() {
-							continue // Skip if no file proxies
-						}
-						pm.UseFileProxies()
+						warnColor("      🔄 Falling back to file proxy...\n")
 					}
-
-					proxyInfo := pm.GetCurrentProxyInfo()
-					fmt.Printf("\n   🌐 [%d/%d] Girl %s | Proxy: %s\n", i+1, len(girls), girlID, proxyInfo)
-
-					attemptFailed := false
-					for week := 1; week <= weeksToCheck; week++ {
-						targetURL := fmt.Sprintf(CalendarBaseFormat, week, girlID)
-
-						slots, err := c.FetchCalendar(targetURL)
-						if err != nil {
-							warnColor("      ⚠️  Error fetching calendar for girl %s via %s: %v\n", girlID, proxyMode, err)
-							attemptFailed = true
-							break // Try next proxy mode
-						}
-
-						if len(slots) > 0 {
-							highlightColor.Printf("\n   ✅ FOUND! GirlID %s | %d available slots! (via %s)\n", girlID, len(slots), proxyInfo)
-							foundSlots = true
-
-							targetSlot := slots[0]
-							fmt.Printf("      Targeting Slot: %s %s\n", targetSlot.Date, targetSlot.DayTime)
-
-							RunReservationSequence(c, girlID, targetSlot)
-
-							if !DryRun {
-								// break
-							}
-						}
-						time.Sleep(200 * time.Millisecond)
-					}
-
-					// If we found slots or didn't fail, no need to try next proxy
-					if !attemptFailed || foundSlots {
-						break
-					}
-
-					// If SmartProxy failed, log the fallback
-					if attemptFailed && proxyMode == "smartproxy" {
-						warnColor("      🔄 SmartProxy failed for girl %s, falling back to file proxy...\n", girlID)
-					}
+					continue // Try next proxy mode
 				}
 
-				// Re-enable SmartProxy as default for next girl
-				pm.UseSmartproxy()
+				if len(slots) > 0 {
+					highlightColor.Printf("\n   🎉 SLOT FOUND! Girl %s | %d available slots!\n", TargetGirlID, len(slots))
+					for j, s := range slots {
+						fmt.Printf("      [%d] %s %s\n", j+1, s.Date, s.DayTime)
+					}
 
-				if !foundSlots {
-					// Minimal output for "Scanning..." feel
-					fmt.Printf("      [%d/%d] Girl %s: No slots.\n", i+1, len(girls), girlID)
+					targetSlot := slots[0]
+					fmt.Printf("\n      ➡️  Booking Slot: %s %s\n", targetSlot.Date, targetSlot.DayTime)
+					foundSlots = true
+
+					RunReservationSequence(c, TargetGirlID, targetSlot)
+
+					if !DryRun {
+						successColor("   🎊 Reservation attempt complete. Exiting.")
+						return
+					}
+				} else {
+					fmt.Printf("      📭 No slots available. Retrying in %v...\n", PollInterval)
 				}
-				time.Sleep(500 * time.Millisecond)
+
+				// If we got a result (success or no slots), don't try fallback proxy
+				break
 			}
-			fmt.Println("\n   💤 Finished pass. Sleeping...")
+
+			// Re-enable SmartProxy for next poll
+			pm.UseSmartproxy()
+
+			if foundSlots && !DryRun {
+				return
+			}
+
 			time.Sleep(PollInterval)
 		}
 	}
