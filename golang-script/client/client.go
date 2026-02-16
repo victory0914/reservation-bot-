@@ -1,11 +1,14 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	stdtls "crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -49,34 +52,116 @@ type LowLatencyClient struct {
 	SafetyTriggeredAt time.Time
 	SafetyReason      string
 
-	ProxyURL string
+	ProxyManager       *ProxyManager
+	FingerprintManager *FingerprintManager
+	CaptchaSolver      CaptchaSolver
+	SafetyManager      *SafetyManager
+	Scheduler          *Scheduler
+
+	ForceStandardTransport bool
 }
 
-func NewLowLatencyClient(cancel context.CancelFunc, simulateStatus int, proxyURL string) *LowLatencyClient {
+func NewLowLatencyClient(cancel context.CancelFunc, simulateStatus int, pm *ProxyManager, fm *FingerprintManager, cs CaptchaSolver, forceStandard ...bool) *LowLatencyClient {
 	// Create cookie jar for session management (shared between both clients)
 	jar, _ := cookiejar.New(nil)
 
+	useStandard := false
+	if len(forceStandard) > 0 && forceStandard[0] {
+		useStandard = true
+	}
+
+	var transport http.RoundTripper
+	if useStandard {
+		// Use standard http.Transport with Proxy
+		transport = &http.Transport{
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				if pm != nil {
+					p := pm.GetNext()
+					if p != "" {
+						if parsed, err := url.Parse(p); err == nil {
+							safeProxy := parsed.Host
+							if parsed.User != nil {
+								safeProxy = fmt.Sprintf("%s@%s", parsed.User.Username(), parsed.Host)
+							}
+							fmt.Printf("   🔄 [Main Proxy] %s %s → via %s://%s\n", req.Method, req.URL.Path, parsed.Scheme, safeProxy)
+						}
+						return url.Parse(p)
+					}
+				}
+				fmt.Printf("   ⚠️  [Main Proxy] %s %s → NO PROXY (direct IP)\n", req.Method, req.URL.Path)
+				return nil, nil
+			},
+			// 10G Optimization & H2 Support
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			TLSClientConfig: &stdtls.Config{
+				NextProtos: []string{"h2", "http/1.1"},
+			},
+		}
+	} else {
+		transport = newFingerprintedTransport(pm)
+	}
+
 	return &LowLatencyClient{
 		client: &http.Client{
-			Transport: newFingerprintedTransport(proxyURL),
+			Transport: transport,
 			Timeout:   20 * time.Second,
 			Jar:       jar, // Enable cookie persistence
 		},
+
 		// Standard TLS client for age verification + login.
 		// The server's age gate rejects the uTLS fingerprint, so we use
 		// standard Go TLS for session establishment. Shares the same cookie jar
 		// so cookies set during login are available to the uTLS client.
+		// NOW ALSO ROUTES THROUGH SMARTPROXY for IP rotation.
 		sessionClient: &http.Client{
 			Timeout: 20 * time.Second,
 			Jar:     jar,
+			Transport: &http.Transport{
+				Proxy: func(req *http.Request) (*url.URL, error) {
+					if pm != nil {
+						// Use sticky proxy: same IP for entire login/reservation flow
+						// Redirects within a request chain MUST use the same IP
+						p := pm.GetSticky()
+						if p != "" {
+							// Log proxy details (mask credentials)
+							if parsed, err := url.Parse(p); err == nil {
+								safeProxy := parsed.Host
+								if parsed.User != nil {
+									username := parsed.User.Username()
+									safeProxy = fmt.Sprintf("%s@%s", username, parsed.Host)
+								}
+								log.Printf("   🔄 [Session Proxy] %s %s → via %s://%s (sticky)", req.Method, req.URL.Path, parsed.Scheme, safeProxy)
+							}
+							return url.Parse(p)
+						}
+					}
+					log.Printf("   ⚠️  [Session Proxy] %s %s → NO PROXY (direct IP)", req.Method, req.URL.Path)
+					return nil, nil
+				},
+				TLSHandshakeTimeout:   10 * time.Second,
+				MaxIdleConns:          100,
+				MaxIdleConnsPerHost:   10,
+				IdleConnTimeout:       90 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
 		},
-		CancelGlobal:         cancel,
-		SimulateRemoteStatus: simulateStatus,
-		ProxyURL:             proxyURL,
+		CancelGlobal:           cancel,
+		SimulateRemoteStatus:   simulateStatus,
+		ProxyManager:           pm,
+		FingerprintManager:     fm,
+		CaptchaSolver:          cs,
+		SafetyManager:          NewSafetyManager(),
+		Scheduler:              NewScheduler(),
+		ForceStandardTransport: useStandard,
 	}
 }
 
-func newFingerprintedTransport(proxyURL string) http.RoundTripper {
+func newFingerprintedTransport(pm *ProxyManager) http.RoundTripper {
 	dialer := &net.Dialer{
 		Timeout:   5 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -85,25 +170,26 @@ func newFingerprintedTransport(proxyURL string) http.RoundTripper {
 	// Create a Transport that uses our custom DialTLSContext
 	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// If proxy is set, use it for TCP dial
-			if proxyURL != "" {
-				u, err := url.Parse(proxyURL)
-				if err != nil {
-					return nil, err
-				}
-				var auth *proxy.Auth
-				if u.User != nil {
-					password, _ := u.User.Password()
-					auth = &proxy.Auth{
-						User:     u.User.Username(),
-						Password: password,
+			// Get a proxy from the manager (rotate per connection)
+			var proxyURL string
+			if pm != nil {
+				proxyURL = pm.GetNext()
+				if proxyURL != "" {
+					// Prepare "safe" URL for logging (hide credentials)
+					safeURL := proxyURL
+					if u, err := url.Parse(proxyURL); err == nil {
+						if u.User != nil {
+							u.User = url.User("******")
+						}
+						safeURL = u.String()
 					}
+					fmt.Printf("   🔄 [Proxy] Rotating to: %s\n", safeURL)
 				}
-				dialer, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
-				if err != nil {
-					return nil, err
-				}
-				return dialer.Dial(network, addr)
+			}
+
+			// If proxy is set, dial via proxy
+			if proxyURL != "" {
+				return dialViaProxy(ctx, "tcp", addr, proxyURL)
 			}
 			return dialer.DialContext(ctx, network, addr)
 		},
@@ -114,25 +200,25 @@ func newFingerprintedTransport(proxyURL string) http.RoundTripper {
 			var conn net.Conn
 			var err error
 
-			if proxyURL != "" {
-				u, err := url.Parse(proxyURL)
-				if err != nil {
-					return nil, err
-				}
-
-				var auth *proxy.Auth
-				if u.User != nil {
-					password, _ := u.User.Password()
-					auth = &proxy.Auth{
-						User:     u.User.Username(),
-						Password: password,
+			// Get a proxy from the manager (rotate per connection)
+			var proxyURL string
+			if pm != nil {
+				proxyURL = pm.GetNext()
+				if proxyURL != "" {
+					// Prepare "safe" URL for logging (hide credentials)
+					safeURL := proxyURL
+					if u, err := url.Parse(proxyURL); err == nil {
+						if u.User != nil {
+							u.User = url.User("******")
+						}
+						safeURL = u.String()
 					}
+					fmt.Printf("   🔄 [Proxy] Rotating to: %s\n", safeURL)
 				}
-				dialer, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
-				if err != nil {
-					return nil, err
-				}
-				conn, err = dialer.Dial(network, addr)
+			}
+
+			if proxyURL != "" {
+				conn, err = dialViaProxy(ctx, "tcp", addr, proxyURL)
 				if err != nil {
 					return nil, err
 				}
@@ -181,24 +267,65 @@ func newFingerprintedTransport(proxyURL string) http.RoundTripper {
 			return uConn, nil
 		},
 		ForceAttemptHTTP2: false, // Strict H1.1
+		MaxConnsPerHost:   1,     // Force frequent new connections to rotate proxies?
+		// Or keep default. Let's Set MaxIdleConnsPerHost to 0 to disable keep-alive if we want strict rotation.
+		// For now, let's keep it simple.
 	}
 }
 
 // Do executes a request using the uTLS-fingerprinted client (for latency-critical requests)
 func (c *LowLatencyClient) Do(req *http.Request) (*http.Response, error) {
+	// 1. Safety Check
+	if c.SafetyManager != nil && c.SafetyManager.IsTriggered() {
+		return nil, fmt.Errorf("safety trigger active: %s", c.SafetyManager.TriggerReason)
+	}
+
 	// Inject default user agent if missing
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	}
-	return c.client.Do(req)
+
+	resp, err := c.client.Do(req)
+
+	// Log request result
+	if err != nil {
+		fmt.Printf("   ❌ [Do] %s %s → ERROR: %v\n", req.Method, req.URL.String(), err)
+	} else {
+		fmt.Printf("   ✅ [Do] %s %s → %s\n", req.Method, req.URL.String(), resp.Status)
+	}
+
+	// 2. Report Result to SafetyManager
+	if c.SafetyManager != nil {
+		if err != nil {
+			c.SafetyManager.CheckError(err)
+		} else {
+			if !c.SafetyManager.CheckResponse(resp) {
+				if c.CancelGlobal != nil {
+					fmt.Println("   🛑 Safety Manager triggered global shutdown.")
+					c.CancelGlobal()
+				}
+			}
+		}
+	}
+
+	return resp, err
 }
 
 // DoSession executes a request using the standard TLS client (for login/age verification)
+// All requests are routed through SmartProxy for IP rotation.
 func (c *LowLatencyClient) DoSession(req *http.Request) (*http.Response, error) {
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 	}
-	return c.sessionClient.Do(req)
+	start := time.Now()
+	resp, err := c.sessionClient.Do(req)
+	duration := time.Since(start)
+	if err != nil {
+		log.Printf("   ❌ [DoSession] %s %s → ERROR after %v: %v", req.Method, req.URL.String(), duration, err)
+		return resp, err
+	}
+	log.Printf("   ✅ [DoSession] %s %s → %s (%v)", req.Method, req.URL.String(), resp.Status, duration)
+	return resp, err
 }
 
 func (c *LowLatencyClient) CookieJar() http.CookieJar {
@@ -276,9 +403,24 @@ func (c *LowLatencyClient) ExecuteRequestWithHeaders(ctx context.Context, method
 		return nil, err
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	// Inject User Agent and Headers from FingerprintManager
+	var ua string
+	if c.FingerprintManager != nil {
+		ua = c.FingerprintManager.GetRandomUserAgent()
+		randomHeaders := c.FingerprintManager.GetRandomHeaders()
+		for k, v := range randomHeaders {
+			req.Header.Set(k, v)
+		}
+	} else {
+		ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	}
+	// Ensure User-Agent is set (randomized or default) overwrites if blank, or we can force it.
+	// The original code only set it if missing. Let's force it if FM is present.
+	if req.Header.Get("User-Agent") == "" || c.FingerprintManager != nil {
+		req.Header.Set("User-Agent", ua)
+	}
 
-	// Apply custom headers
+	// Apply custom headers (overwrites randomized ones if conflict)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -286,6 +428,50 @@ func (c *LowLatencyClient) ExecuteRequestWithHeaders(ctx context.Context, method
 	// Critical section: Execute the request
 	start = time.Now()
 	resp, err := c.client.Do(req)
+
+	// CAPTCHA HANDLING
+	// If response suggests CAPTCHA (e.g. 403 or specific content), try to solve.
+	// For now, let's assume 403 *might* be CAPTCHA or Block.
+	// In a real scenario, we'd read the body and check for "recaptcha" or similar.
+	if err == nil && (resp.StatusCode == 403 || resp.StatusCode == 429) {
+		// Simple heuristic: if 403, try to solve CAPTCHA if Solver is available.
+		if c.CaptchaSolver != nil {
+			fmt.Println("[CAPTCHA] Suspicious status code detected. Attempting to solve...")
+			// Drain old body
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+
+			// Solve
+			// We need a site key. In real app, we'd scrape it from body.
+			// Passing dummy site key for now.
+			solution, solveErr := c.CaptchaSolver.Solve("DUMMY_SITE_KEY", url)
+			if solveErr == nil {
+				fmt.Printf("[CAPTCHA] Solved! Solution: %s. Retrying request...\n", solution)
+				// Retry logic:
+				// Re-create request (bodyReader is consumed, need to reset if possible)
+				if body != nil {
+					bodyReader = bytes.NewReader(body)
+					req, _ = http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), method, url, bodyReader)
+					// Verify headers again?
+					req.Header.Set("User-Agent", ua)
+				} else {
+					req, _ = http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), method, url, nil)
+					req.Header.Set("User-Agent", ua)
+				}
+				// Re-apply headers
+				for k, v := range headers {
+					req.Header.Set(k, v)
+				}
+
+				// Retry
+				start = time.Now() // Reset start time for retry
+				resp, err = c.client.Do(req)
+			} else {
+				fmt.Printf("[CAPTCHA] Failed to solve: %v\n", solveErr)
+			}
+		}
+	}
+
 	total := time.Since(start)
 
 	result := &RequestResult{
@@ -347,4 +533,87 @@ func (c *LowLatencyClient) ExecuteRequestWithHeaders(ctx context.Context, method
 	result.Body = bodyBytes
 
 	return result, nil
+}
+
+// dialViaProxy establishes a connection to the target address via the specified proxy.
+// It supports both SOCKS5 and HTTP CONNECT tunneling.
+func dialViaProxy(ctx context.Context, network, addr, proxyURL string) (net.Conn, error) {
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy url: %w", err)
+	}
+
+	switch u.Scheme {
+	case "socks5":
+		var auth *proxy.Auth
+		if u.User != nil {
+			password, _ := u.User.Password()
+			auth = &proxy.Auth{
+				User:     u.User.Username(),
+				Password: password,
+			}
+		}
+		dialer, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
+		if err != nil {
+			return nil, err
+		}
+		return dialer.Dial(network, addr)
+
+	case "http", "https":
+		// HTTP CONNECT Tunneling
+		// 1. Dial TCP to the proxy server
+		proxyDialer := &net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+		conn, err := proxyDialer.DialContext(ctx, "tcp", u.Host)
+		if err != nil {
+			return nil, fmt.Errorf("failed to dial http proxy: %w", err)
+		}
+
+		// 2. Send CONNECT request
+		// CONNECT target:port HTTP/1.1
+		// Host: target:port
+		// Proxy-Authorization: Basic <base64> (if needed)
+		req := &http.Request{
+			Method: "CONNECT",
+			URL:    &url.URL{Host: addr},
+			Host:   addr,
+			Header: make(http.Header),
+		}
+
+		if u.User != nil {
+			password, _ := u.User.Password()
+			auth := u.User.Username() + ":" + password
+			basicAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
+			req.Header.Set("Proxy-Authorization", basicAuth)
+		}
+
+		// Add standard headers that might be required by strict proxies
+		// req.Header.Set("User-Agent", "Go-http-client/1.1")
+		// req.Header.Set("Proxy-Connection", "Keep-Alive")
+
+		if err := req.Write(conn); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to write connect request: %w", err)
+		}
+
+		// 3. Read response
+		resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to read connect response: %w", err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			conn.Close()
+			return nil, fmt.Errorf("proxy connect failed: %s", resp.Status)
+		}
+
+		return conn, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme: %s", u.Scheme)
+	}
 }

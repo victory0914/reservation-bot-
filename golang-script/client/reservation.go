@@ -529,7 +529,7 @@ func (c *LowLatencyClient) SelectCourse(urlStr, courseID string) error {
 	bodyStr := string(bodyBytes)
 
 	// Save for debugging
-	os.WriteFile("debug_course_page.html", bodyBytes, 0644)
+	os.WriteFile("debug_html/debug_course_page.html", bodyBytes, 0644)
 
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(bodyStr))
 	if err != nil {
@@ -592,14 +592,14 @@ func (c *LowLatencyClient) SelectCourse(urlStr, courseID string) error {
 	return nil
 }
 
-// SubmitProfile submits user details and returns the response body of the resulting page
-func (c *LowLatencyClient) SubmitProfile(urlStr string, config ReservationConfig) ([]byte, error) {
+// SubmitProfile submits user details and returns the response body of the resulting page and its URL
+func (c *LowLatencyClient) SubmitProfile(urlStr string, config ReservationConfig) ([]byte, string, error) {
 	// 1. GET request (fetch CSRF and other hidden fields)
 	reqGet, _ := http.NewRequest("GET", urlStr, nil)
 	reqGet.Header.Set("Referer", "https://yoyaku.cityheaven.net/select_course/")
 	respGet, err := c.DoSession(reqGet)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer respGet.Body.Close()
 
@@ -608,13 +608,13 @@ func (c *LowLatencyClient) SubmitProfile(urlStr string, config ReservationConfig
 
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(bodyStr))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse profile page: %w", err)
+		return nil, "", fmt.Errorf("failed to parse profile page: %w", err)
 	}
 
 	form := doc.Find("form").First()
 	if form.Length() == 0 {
-		os.WriteFile("debug_profile_error.html", bodyBytes, 0644)
-		return nil, fmt.Errorf("failed to find profile form")
+		os.WriteFile("debug_html/debug_profile_error.html", bodyBytes, 0644)
+		return nil, "", fmt.Errorf("failed to find profile form")
 	}
 
 	// 2. Extract all hidden fields and set user details
@@ -637,7 +637,7 @@ func (c *LowLatencyClient) SubmitProfile(urlStr string, config ReservationConfig
 
 	reqPost, err := http.NewRequest("POST", urlStr, strings.NewReader(data.Encode()))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	reqPost.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	reqPost.Header.Set("Referer", urlStr)
@@ -645,21 +645,69 @@ func (c *LowLatencyClient) SubmitProfile(urlStr string, config ReservationConfig
 
 	respPost, err := c.DoSession(reqPost)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer respPost.Body.Close()
 
 	log.Printf("SubmitProfile POST Status: %s, Final URL: %s", respPost.Status, respPost.Request.URL.String())
 
 	finalBody, _ := io.ReadAll(respPost.Body)
-	if respPost.StatusCode >= 400 {
-		return finalBody, fmt.Errorf("profile submission failed: %s", respPost.Status)
+	finalURL := respPost.Request.URL.String()
+
+	// Check if we were redirected to an error page (e.g. /error/.../EFRESV020801/...)
+	if strings.Contains(finalURL, "/error/") {
+		// Extract error code from URL path
+		errCode := ""
+		parts := strings.Split(finalURL, "/")
+		for _, p := range parts {
+			if strings.HasPrefix(p, "EF") || strings.HasPrefix(p, "ER") {
+				errCode = p
+				break
+			}
+		}
+		// Also try to extract the error message from the HTML
+		errMsg := ""
+		doc, _ := goquery.NewDocumentFromReader(strings.NewReader(string(finalBody)))
+		if doc != nil {
+			errMsg = strings.TrimSpace(doc.Find(".error-msg").Text())
+		}
+		os.WriteFile("debug_html/debug_profile_error.html", finalBody, 0644)
+		if errMsg != "" {
+			return finalBody, finalURL, fmt.Errorf("profile submission failed: server error %s: %s", errCode, errMsg)
+		}
+		return finalBody, finalURL, fmt.Errorf("profile submission failed: server error (code: %s, URL: %s)", errCode, finalURL)
 	}
-	return finalBody, nil
+
+	// Check for validation errors in the response
+	// If we are still on the input page (form action contains input_profile), it's a validation error
+	// Or check for specific error classes
+	if strings.Contains(string(finalBody), "errorstyle") || strings.Contains(string(finalBody), "error-message") || strings.Contains(string(finalBody), "error-msg") {
+		// Try to extract the error message
+		doc, _ := goquery.NewDocumentFromReader(strings.NewReader(string(finalBody)))
+		errMsg := doc.Find(".errorstyle").Text()
+		if errMsg == "" {
+			errMsg = doc.Find(".error-message").Text()
+		}
+		if errMsg == "" {
+			errMsg = doc.Find(".error-msg").Text()
+		}
+		return finalBody, finalURL, fmt.Errorf("profile submission validation error: %s", strings.TrimSpace(errMsg))
+	}
+
+	// Check if we are still on the input page (by Title or Form Action)
+	// If the page title is still "Input Contact", we failed to advance
+	if strings.Contains(string(finalBody), "ご連絡先を入力ください") {
+		return finalBody, finalURL, fmt.Errorf("profile submission failed: returned to input page without specific error message")
+	}
+
+	if respPost.StatusCode >= 400 {
+		return finalBody, finalURL, fmt.Errorf("profile submission failed: %s", respPost.Status)
+	}
+	return finalBody, finalURL, nil
 }
 
 // ConfirmReservation finalizes the booking
-func (c *LowLatencyClient) ConfirmReservation(urlStr string, initialBody []byte, dryRun bool) error {
+func (c *LowLatencyClient) ConfirmReservation(urlStr string, refererURL string, initialBody []byte, dryRun bool) error {
 	var bodyBytes []byte
 	var err error
 
@@ -688,9 +736,24 @@ func (c *LowLatencyClient) ConfirmReservation(urlStr string, initialBody []byte,
 
 	form := doc.Find("form").First()
 	if form.Length() == 0 {
-		os.WriteFile("debug_confirm_error.html", bodyBytes, 0644)
+		os.WriteFile("debug_html/debug_confirm_error.html", bodyBytes, 0644)
 		return fmt.Errorf("failed to find confirm form")
 	}
+
+	// Determine the actual POST URL from the form's action attribute.
+	// If the form has an explicit action, use it (resolving relative URLs).
+	// Otherwise, fall back to urlStr (the page URL we were given).
+	postURL := urlStr
+	if formAction, exists := form.Attr("action"); exists && formAction != "" {
+		if strings.HasPrefix(formAction, "/") {
+			// Relative URL — resolve against yoyaku domain
+			postURL = "https://yoyaku.cityheaven.net" + formAction
+		} else if strings.HasPrefix(formAction, "http") {
+			postURL = formAction
+		}
+		// else leave as urlStr
+	}
+	log.Printf("ConfirmReservation: POST target URL = %s", postURL)
 
 	// Extract all hidden fields (especially _csrf)
 	data := url.Values{}
@@ -701,19 +764,21 @@ func (c *LowLatencyClient) ConfirmReservation(urlStr string, initialBody []byte,
 		}
 	})
 
+	log.Printf("ConfirmReservation: POST fields = %v", data)
+
 	if dryRun {
-		log.Println("DRY RUN: Skipping final POST to", urlStr)
+		log.Println("DRY RUN: Skipping final POST to", postURL)
 		log.Printf("Would have sent fields: %v", data)
 		return nil
 	}
 
 	// 2. POST
-	reqPost, err := http.NewRequest("POST", urlStr, strings.NewReader(data.Encode()))
+	reqPost, err := http.NewRequest("POST", postURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return err
 	}
 	reqPost.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	reqPost.Header.Set("Referer", urlStr)
+	reqPost.Header.Set("Referer", refererURL)
 	reqPost.Header.Set("Origin", "https://yoyaku.cityheaven.net")
 
 	respPost, err := c.DoSession(reqPost)
@@ -723,6 +788,19 @@ func (c *LowLatencyClient) ConfirmReservation(urlStr string, initialBody []byte,
 	defer respPost.Body.Close()
 
 	log.Println("Reservation Confirm Status:", respPost.Status)
+
+	// 3. Verify Success
+	finalBody, _ := io.ReadAll(respPost.Body)
+	finalBodyStr := string(finalBody)
+
+	// Check for success indicators
+	// "予約完了" (Reservation Complete), "ありがとうございます" (Thank you)
+	if !strings.Contains(finalBodyStr, "予約完了") && !strings.Contains(finalBodyStr, "ありがとうございます") && !strings.Contains(finalBodyStr, "Reservation Complete") {
+		// Save debug HTML
+		os.WriteFile("debug_html/debug_confirm_failed.html", finalBody, 0644)
+		return fmt.Errorf("reservation confirmation failed (success message not found in response)")
+	}
+
 	return nil
 }
 
@@ -745,13 +823,14 @@ func (c *LowLatencyClient) GetCSRFToken(urlStr string) (string, error) {
 
 	token, err := ExtractCSRFToken(string(bodyBytes))
 	if err != nil {
-		os.WriteFile("debug_csrf_error.html", bodyBytes, 0644)
+		os.WriteFile("debug_html/debug_csrf_error.html", bodyBytes, 0644)
 	}
 	return token, err
 }
 
 // CheckReservations fetches the current account's reservation history
 func (c *LowLatencyClient) CheckReservations() ([]Reservation, error) {
+	// 1. Fetch the parent "My Page" reservation page
 	urlStr := "https://www.cityheaven.net/tt/community/SBMyReservation/?lo=1&pcmode=sp"
 	log.Printf("Checking reservation history at: %s", urlStr)
 
@@ -770,14 +849,49 @@ func (c *LowLatencyClient) CheckReservations() ([]Reservation, error) {
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	bodyStr := string(bodyBytes)
 
+	// 2. Look for the iframe that contains the actual history
+	// <iframe src="/tt/community/S1ShareToReservationLogin/?forward=F4&pcmode=sp" ...>
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(bodyStr))
+	if err != nil {
+		return nil, err
+	}
+
+	iframeSrc := doc.Find("iframe").AttrOr("src", "")
+	if iframeSrc == "" {
+		// Fallback: Check if we are already on the history list (unlikely based on structure)
+		log.Println("Warning: No iframe found in My Reservation page. Parsing parent page directly.")
+	} else {
+		// 3. Fetch the iframe content
+		// Handle relative URL
+		if strings.HasPrefix(iframeSrc, "/") {
+			iframeSrc = "https://www.cityheaven.net" + iframeSrc
+		}
+		log.Printf("Fetching reservation history iframe: %s", iframeSrc)
+
+		reqFrame, err := http.NewRequest("GET", iframeSrc, nil)
+		if err != nil {
+			return nil, err
+		}
+		reqFrame.Header.Set("Referer", urlStr)
+
+		respFrame, err := c.DoSession(reqFrame)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch history iframe: %w", err)
+		}
+		defer respFrame.Body.Close()
+
+		bodyBytes, _ = io.ReadAll(respFrame.Body)
+		bodyStr = string(bodyBytes)
+	}
+
 	// Save for debugging
-	os.WriteFile("debug_reservations.html", bodyBytes, 0644)
+	os.WriteFile("debug_html/debug_reservations_iframe.html", bodyBytes, 0644)
 
 	if strings.Contains(bodyStr, "該当する予約履歴情報はありません") {
 		return nil, nil
 	}
 
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(bodyStr))
+	doc, err = goquery.NewDocumentFromReader(strings.NewReader(bodyStr))
 	if err != nil {
 		return nil, err
 	}
@@ -801,6 +915,10 @@ func (c *LowLatencyClient) CheckReservations() ([]Reservation, error) {
 		}
 		if res.GirlName == "" {
 			res.GirlName = strings.TrimSpace(s.Find("dt:contains('女性名') + dd").Text())
+		}
+		if res.Date == "" {
+			// Date might be parsed from a header or combined string
+			res.Date = strings.TrimSpace(s.Find("dt:contains('日時') + dd").Text())
 		}
 
 		if res.ShopName != "" || res.GirlName != "" {

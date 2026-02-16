@@ -3,6 +3,7 @@ package main
 import (
 	"booker-bot/client"
 	"context"
+	"fmt"
 	"log"
 )
 
@@ -13,20 +14,21 @@ func main() {
 	defer cancel()
 
 	// Initialize Client
-	c := client.NewLowLatencyClient(cancel, 0, "")
+	client := client.NewLowLatencyClient(cancel, 0, nil, nil, nil)
 
 	// 1. Login
 	username := "amritacharya"
 	password := "12345678" // Use your actual login
 
-	log.Println("Logging in...")
-	if err := c.Login(username, password); err != nil {
+	fmt.Printf("Logging in as %s...\n", username)            // Changed log.Println to fmt.Printf
+	if err := client.Login(username, password); err != nil { // Changed c.Login to client.Login
 		log.Fatalf("Login failed: %v", err)
 	}
+	fmt.Println("Login successful!") // Added new line
 
 	// 2. Check Reservations
-	log.Println("Fetching reservation history...")
-	reservations, err := c.CheckReservations()
+	fmt.Println("Checking reservations...")         // Changed log.Println to fmt.Println
+	reservations, err := client.CheckReservations() // Changed c.CheckReservations to client.CheckReservations
 	if err != nil {
 		log.Fatalf("Failed to check reservations: %v", err)
 	}

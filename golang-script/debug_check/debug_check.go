@@ -2,6 +2,7 @@ package main
 
 import (
 	"booker-bot/client"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,8 @@ const (
 	TargetGirlID    = "18037583"
 	TargetShopID    = "2310001233"
 	TargetCourseID  = "253139"
+	AreaPath        = "niigata/A1501/A150101"
+	ShopDir         = "arabiannight"
 	S6URLFormat     = "https://www.cityheaven.net/niigata/A1501/A150101/arabiannight/S6ShareToReservationLogin/?forward=F1&girl_id=%s&pcmode=sp"
 	CourseSelectURL = "https://yoyaku.cityheaven.net/select_course/niigata/A1501/A150101/arabiannight"
 	ProfileInputURL = "https://yoyaku.cityheaven.net/input_profile/niigata/A1501/A150101/arabiannight"
@@ -24,23 +27,25 @@ func main() {
 
 	// 1. Verify Login & CSRF
 	fmt.Println("Step 1: Login")
-	c := client.NewLowLatencyClient(func() {}, 0, "")
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := client.NewLowLatencyClient(cancel, 0, nil, nil, nil, false)
 
-	if err := c.Login(Username, Password); err != nil {
+	if err := client.Login(Username, Password); err != nil {
 		fmt.Printf("Login failed: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Println("Login successful.")
 
 	// Check cookies after login
-	c.DebugCookies("https://www.cityheaven.net")
-	c.DebugCookies("https://yoyaku.cityheaven.net")
+	client.DebugCookies("https://www.cityheaven.net")
+	client.DebugCookies("https://yoyaku.cityheaven.net")
 
 	// 2. Fetch Calendar for specific girl
 	targetURL := fmt.Sprintf(S6URLFormat, TargetGirlID)
 	fmt.Printf("Step 2: Fetching Calendar for Girl %s from %s\n", TargetGirlID, targetURL)
 
-	slots, err := c.FetchCalendar(targetURL)
+	slots, err := client.FetchCalendar(targetURL)
 	if err != nil {
 		fmt.Printf("FetchCalendar returned error: %v\n", err)
 		os.Exit(1)
@@ -71,9 +76,9 @@ func main() {
 	fmt.Printf("A. Selecting Slot: %s %s (API: %s)\n", targetSlot.Date, targetSlot.DayTime, rawTime)
 
 	// Check cookies before SelectSlot
-	c.DebugCookies("https://yoyaku.cityheaven.net")
+	client.DebugCookies("https://yoyaku.cityheaven.net")
 
-	if err := c.SelectSlot(TargetShopID, TargetGirlID, targetSlot.Date, rawTime); err != nil {
+	if err := client.SelectSlot(AreaPath, ShopDir, TargetGirlID, targetSlot.Date, rawTime); err != nil {
 		fmt.Printf("SelectSlot failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -81,27 +86,41 @@ func main() {
 
 	// B. Select Course (Checks CSRF)
 	fmt.Println("B. Selecting Course...")
-	c.DebugCookies("https://yoyaku.cityheaven.net")
+	client.DebugCookies("https://yoyaku.cityheaven.net")
 
-	if err := c.SelectCourse(CourseSelectURL, TargetCourseID); err != nil {
+	if err := client.SelectCourse(CourseSelectURL, TargetCourseID); err != nil {
 		fmt.Printf("SelectCourse failed: %v\n", err)
 		// Dump HTML if CSRF error
 		fmt.Println("Dumping Course Page...")
-		dumpPage(c, CourseSelectURL, "debug_course_error.html")
+		dumpPage(client, CourseSelectURL, "debug_course_error.html")
 		os.Exit(1)
 	}
 	fmt.Println("Course selected.")
 
 	// C. Submit Profile (Checks CSRF)
 	fmt.Println("C. Checking Profile Page (CSRF)...")
-	token, err := c.GetCSRFToken(ProfileInputURL)
+	token, err := client.GetCSRFToken(ProfileInputURL)
 	if err != nil {
 		fmt.Printf("Profile Page CSRF failed: %v\n", err)
-		dumpPage(c, ProfileInputURL, "debug_profile_error.html")
+		dumpPage(client, ProfileInputURL, "debug_profile_error.html")
 		os.Exit(1)
 	}
 	fmt.Printf("Profile Page CSRF Token found: %s\n", token)
 	fmt.Println("SUCCESS: Full sequence CSRF checks passed!")
+
+	// 4. Check Reservation History
+	fmt.Println("Step 4: Check Reservation History")
+	reservations, err := client.CheckReservations()
+	if err != nil {
+		fmt.Printf("CheckReservations failed: %v\n", err)
+	} else if len(reservations) == 0 {
+		fmt.Println("No reservations found.")
+	} else {
+		fmt.Printf("Found %d reservations:\n", len(reservations))
+		for _, r := range reservations {
+			fmt.Printf(" - %s at %s (%s) - %s\n", r.GirlName, r.ShopName, r.Date, r.Status)
+		}
+	}
 }
 
 func dumpPage(c *client.LowLatencyClient, urlStr, filename string) {
