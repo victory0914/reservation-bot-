@@ -36,7 +36,7 @@ const (
 	ConfirmURL      = "https://yoyaku.cityheaven.net/Confirm/ConfirmList/niigata/A1501/A150101/arabiannight"
 
 	PollInterval = 2000 * time.Millisecond // Slower poll for safety when iterating list
-	DryRun       =  true                   // Set to false to actually book
+	DryRun       =  false                   // Set to false to actually book
 )
 
 func main() {
@@ -59,6 +59,20 @@ func main() {
 		log.Fatalf("Critical: Login failed: %v", err)
 	}
 	log.Println("Login successful.")
+
+	// 1b. Check existing reservations
+	log.Println("Checking existing reservations...")
+	existing, err := c.CheckReservations()
+	if err != nil {
+		log.Printf("Warning: Could not check reservation history: %v", err)
+	} else if len(existing) == 0 {
+		log.Println("No active reservations found on My Page.")
+	} else {
+		log.Printf("Found %d active reservations:", len(existing))
+		for _, res := range existing {
+			log.Printf("  - [%s] %s at %s (%s) - Status: %s", res.Date, res.GirlName, res.ShopName, res.Time, res.Status)
+		}
+	}
 
 	// 2. Polling Loop
 	log.Println("Step 2: Starting Polling Loop with Auto-Discovery...")

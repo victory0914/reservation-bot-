@@ -32,6 +32,15 @@ type ReservationConfig struct {
 	BirthMonth string
 }
 
+// Reservation represents an existing booking found in My Page
+type Reservation struct {
+	ShopName string
+	GirlName string
+	Date     string
+	Time     string
+	Status   string
+}
+
 // Slot represents a time slot from the JSON or HTML
 type Slot struct {
 	DayTime string // e.g. "14:00"
@@ -739,4 +748,65 @@ func (c *LowLatencyClient) GetCSRFToken(urlStr string) (string, error) {
 		os.WriteFile("debug_csrf_error.html", bodyBytes, 0644)
 	}
 	return token, err
+}
+
+// CheckReservations fetches the current account's reservation history
+func (c *LowLatencyClient) CheckReservations() ([]Reservation, error) {
+	urlStr := "https://www.cityheaven.net/tt/community/SBMyReservation/?lo=1&pcmode=sp"
+	log.Printf("Checking reservation history at: %s", urlStr)
+
+	req, err := http.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Referer", "https://www.cityheaven.net/tt/community/ABMypageHome/")
+
+	resp, err := c.DoSession(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyStr := string(bodyBytes)
+
+	// Save for debugging
+	os.WriteFile("debug_reservations.html", bodyBytes, 0644)
+
+	if strings.Contains(bodyStr, "該当する予約履歴情報はありません") {
+		return nil, nil
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(bodyStr))
+	if err != nil {
+		return nil, err
+	}
+
+	var reservations []Reservation
+
+	// Each reservation is usually in a div or table.
+	// Based on typical City Heaven structure:
+	doc.Find(".reservation-list li, .yoyaku-history-box").Each(func(i int, s *goquery.Selection) {
+		res := Reservation{
+			ShopName: strings.TrimSpace(s.Find(".shop-name").Text()),
+			GirlName: strings.TrimSpace(s.Find(".girl-name").Text()),
+			Date:     strings.TrimSpace(s.Find(".date").Text()),
+			Time:     strings.TrimSpace(s.Find(".time").Text()),
+			Status:   strings.TrimSpace(s.Find(".status").Text()),
+		}
+
+		// Fallback for different layouts
+		if res.ShopName == "" {
+			res.ShopName = strings.TrimSpace(s.Find("dt:contains('店舗名') + dd").Text())
+		}
+		if res.GirlName == "" {
+			res.GirlName = strings.TrimSpace(s.Find("dt:contains('女性名') + dd").Text())
+		}
+
+		if res.ShopName != "" || res.GirlName != "" {
+			reservations = append(reservations, res)
+		}
+	})
+
+	return reservations, nil
 }
